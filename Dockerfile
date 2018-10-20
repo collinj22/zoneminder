@@ -82,6 +82,7 @@ RUN	systemd-tmpfiles --create zoneminder.conf && \
 	cp -p /etc/zm/zm.conf /root/zm.conf
 	
 RUN	apt-get -y install python-pip && \ 
+	apt-get -y install wget && \
  	pip install opencv-python
 
 RUN	apt-get -y remove wget make && \
