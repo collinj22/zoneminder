@@ -25,6 +25,7 @@ RUN add-apt-repository -y ppa:iconnor/zoneminder-$ZM_VERS && \
 	apt-get -y install php$PHP_VERS php$PHP_VERS-fpm php$PHP_VERS-mysql php$PHP_VERS-common php$PHP_VERS-gd && \
 	apt-get -y install php$PHP_VERS-json php$PHP_VERS-cli php$PHP_VERS-curl libapache2-mod-php$PHP_VERS && \
 	apt-get -y install libcrypt-mysql-perl libyaml-perl libjson-perl && \
+	apt-get -y install python-opencv && \
 	apt-get -y install zoneminder
 
 RUN	rm /etc/mysql/my.cnf && \
@@ -74,6 +75,7 @@ RUN	mv /root/zoneminder /etc/init.d/zoneminder && \
 RUN	systemd-tmpfiles --create zoneminder.conf && \
 	mv /root/default-ssl.conf /etc/apache2/sites-enabled/default-ssl.conf && \
 	mkdir /etc/apache2/ssl/ && \
+	mkdir /root/opencv/ && \
 	chmod a+x /usr/bin/zmeventnotification.pl && \
 	mkdir /etc/private && \
 	chmod 777 /etc/private && \
