@@ -25,7 +25,6 @@ RUN add-apt-repository -y ppa:iconnor/zoneminder-$ZM_VERS && \
 	apt-get -y install php$PHP_VERS php$PHP_VERS-fpm php$PHP_VERS-mysql php$PHP_VERS-common php$PHP_VERS-gd && \
 	apt-get -y install php$PHP_VERS-json php$PHP_VERS-cli php$PHP_VERS-curl libapache2-mod-php$PHP_VERS && \
 	apt-get -y install libcrypt-mysql-perl libyaml-perl libjson-perl && \
-	apt-get -y install python-opencv && \
 	apt-get -y install zoneminder
 
 RUN	rm /etc/mysql/my.cnf && \
@@ -81,6 +80,9 @@ RUN	systemd-tmpfiles --create zoneminder.conf && \
 	chmod 777 /etc/private && \
 	chmod -R +x /etc/my_init.d/ && \
 	cp -p /etc/zm/zm.conf /root/zm.conf
+	
+RUN	apt-get -y install python-pip
+ 	pip install opencv-python
 
 RUN	apt-get -y remove wget make && \
 	apt-get -y clean && \
