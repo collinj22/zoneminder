@@ -83,6 +83,8 @@ RUN	systemd-tmpfiles --create zoneminder.conf && \
 	
 RUN	apt-get -y install python-pip && \ 
 	apt-get -y install wget && \
+	apt-get install -y libsm6 && \
+ 	apt-get install -y libxrender-dev && \
  	pip install opencv-python
 
 RUN	apt-get -y remove wget make && \
