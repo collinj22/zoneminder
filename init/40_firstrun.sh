@@ -107,6 +107,8 @@ chown -R $PUID:$PGID /config/zmeventnotification.ini
 chmod -R 666 /config/zmeventnotification.ini
 chown -R $PUID:$PGID /config/keys
 chmod -R 777 /config/keys
+chown -R www-data:www-data /detect
+chmod -R 777 /detect
 
 # Create events folder
 if [ ! -d /var/cache/zoneminder/events ]; then
