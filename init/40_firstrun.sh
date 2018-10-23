@@ -11,6 +11,14 @@ else
 	echo "Using existing conf folder"
 fi
 
+# Search for detect files, if they don't exist, create the default ones
+if [ ! -d /detect/images ]; then
+	echo "Creating images folder"
+	mkdir /detect/images
+else
+	echo "Using existing images folder"
+fi
+
 if [ -f /root/zm.conf ]; then
 	echo "Moving zm.conf to config folder"
 	mv /root/zm.conf /config/conf/zm.default
