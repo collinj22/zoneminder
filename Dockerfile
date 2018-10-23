@@ -15,7 +15,7 @@ COPY defaults/ /root/
 COPY zmeventnotification/zmeventnotification.pl /usr/bin/
 COPY zmeventnotification/zmeventnotification.ini /root/
 
-RUN add-apt-repository -y ppa:iconnor/zoneminder-$ZM_VERS && \
+RUN 	add-apt-repository -y ppa:iconnor/zoneminder-$ZM_VERS && \
 	add-apt-repository ppa:ondrej/php && \
 	apt-get update && \
 	apt-get -y upgrade -o Dpkg::Options::="--force-confold" && \
@@ -83,8 +83,8 @@ RUN	systemd-tmpfiles --create zoneminder.conf && \
 	
 RUN	apt-get -y install python-pip && \ 
 	apt-get -y install wget && \
-	apt-get install -y libsm6 && \
- 	apt-get install -y libxrender-dev && \
+	apt-get -y install libsm6 && \
+ 	apt-get -y install libxrender-dev && \
  	pip install opencv-python
 
 RUN	apt-get -y remove wget make && \
@@ -94,6 +94,7 @@ RUN	apt-get -y remove wget make && \
 
 VOLUME \
 	["/config"] \
+	["/detect"] \
 	["/var/cache/zoneminder"]
 
 EXPOSE 80 443 9000
