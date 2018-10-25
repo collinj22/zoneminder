@@ -74,7 +74,6 @@ RUN	mv /root/zoneminder /etc/init.d/zoneminder && \
 RUN	systemd-tmpfiles --create zoneminder.conf && \
 	mv /root/default-ssl.conf /etc/apache2/sites-enabled/default-ssl.conf && \
 	mkdir /etc/apache2/ssl/ && \
-	mkdir /root/opencv/ && \
 	chmod a+x /usr/bin/zmeventnotification.pl && \
 	mkdir /etc/private && \
 	chmod 777 /etc/private && \
