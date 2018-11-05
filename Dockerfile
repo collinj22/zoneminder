@@ -4,7 +4,7 @@ LABEL maintainer="dlandon"
 
 ENV	PHP_VERS="7.1"
 ENV ZM_VERS="1.32"
-ENV ZMEVENT_VERS="2.0"
+ENV ZMEVENT_VERS="2.2"
 
 ENV	SHMEM="50%" \
 	PUID="99" \
@@ -22,8 +22,7 @@ RUN add-apt-repository -y ppa:iconnor/zoneminder-$ZM_VERS && \
 	apt-get -y dist-upgrade && \
 	apt-get -y install apache2 mariadb-server && \
 	apt-get -y install ssmtp mailutils net-tools libav-tools wget sudo make && \
-	apt-get -y install php$PHP_VERS php$PHP_VERS-fpm php$PHP_VERS-mysql php$PHP_VERS-common php$PHP_VERS-gd && \
-	apt-get -y install php$PHP_VERS-json php$PHP_VERS-cli php$PHP_VERS-curl libapache2-mod-php$PHP_VERS && \
+	apt-get -y install php$PHP_VERS php$PHP_VERS-fpm libapache2-mod-php$PHP_VERS php$PHP_VERS-mysql php$PHP_VERS-gd && \
 	apt-get -y install libcrypt-mysql-perl libyaml-perl libjson-perl && \
 	apt-get -y install zoneminder
 
@@ -78,7 +77,9 @@ RUN	systemd-tmpfiles --create zoneminder.conf && \
 	mkdir /etc/private && \
 	chmod 777 /etc/private && \
 	chmod -R +x /etc/my_init.d/ && \
-	cp -p /etc/zm/zm.conf /root/zm.conf
+	cp -p /etc/zm/zm.conf /root/zm.conf && \
+	echo "#!/bin/sh\n\n/usr/bin/zmaudit.pl -f" >> /etc/cron.weekly/zmaudit && \
+	chmod +x /etc/cron.weekly/zmaudit
 
 RUN	apt-get -y remove wget make && \
 	apt-get -y clean && \

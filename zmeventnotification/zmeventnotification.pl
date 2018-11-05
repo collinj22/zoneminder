@@ -36,7 +36,12 @@
 
 use strict;
 use bytes;
+use POSIX ':sys_wait_h';
+use Time::HiRes qw/gettimeofday/;
+use Symbol qw(qualify_to_ref);
+use IO::Select;
 
+use Data::Dump qw(dump);
 # ==========================================================================
 #
 # Starting v1.0, configuration has moved to a separate file, please make sure
@@ -51,7 +56,7 @@ use bytes;
 # ==========================================================================
 
 
-my $app_version="2.0-docker";
+my $app_version="2.2-docker";
 
 # ==========================================================================
 #
@@ -67,7 +72,6 @@ my $app_version="2.0-docker";
 use constant DEFAULT_CONFIG_FILE => "/etc/zmeventnotification.ini";
 
 use constant DEFAULT_PORT => 9000;
-use constant DEFAULT_ADDRESS => '[::]';
 use constant DEFAULT_AUTH_ENABLE => 1;
 use constant DEFAULT_AUTH_TIMEOUT => 20;
 use constant DEFAULT_FCM_ENABLE => 1;
@@ -139,6 +143,7 @@ my $dummyEventTimeLastSent = time();
 
 if (!try_use ("Net::WebSocket::Server")) {Fatal ("Net::WebSocket::Server missing");}
 if (!try_use ("IO::Socket::SSL")) {Fatal ("IO::Socket::SSL missing");}
+if (!try_use ("IO::Handle")) {Fatal ("IO::Handle");}
 if (!try_use ("Config::IniFiles")) {Fatal ("Config::Inifiles missing");}
 if (!try_use ("Getopt::Long")) {Fatal ("Getopt::Long missing");}
 if (!try_use ("File::Basename")) {Fatal ("File::Basename missing");}
@@ -160,7 +165,6 @@ Usage: zmeventnotification.pl [OPTION]...
   --check-config                      Print configuration and exit.
 
   --port=PORT                         Port for Websockets connection (default: 9000).
-  --address=ADDRESS                   Address for Websockets server (default: [::]).
 
   --enable-auth                       Check username/password against ZoneMinder database (default: true).
   --no-enable-auth                    Don't check username/password against ZoneMinder database (default: false).
@@ -315,10 +319,10 @@ if ($ssl_enabled && (!$ssl_cert_file || !$ssl_key_file)) {
 
 my $notId = 1;
 
-use constant PENDING_AUTH      =>  '1';
-use constant VALID_WEBSOCKET   =>  '0';
-use constant INVALID_WEBSOCKET =>  '-1'; # only when token is true but websocket is bad for supp data
-use constant PENDING_DELETE    =>  '-2';
+use constant PENDING_AUTH      =>  1;
+use constant VALID_WEBSOCKET   =>  2;
+use constant INVALID_WEBSOCKET =>  3; # only when token is true but websocket is bad for supp data
+use constant PENDING_DELETE    =>  4;
 
 
 # this is just a wrapper around Config::IniFiles val
@@ -445,8 +449,7 @@ use ZoneMinder;
 use POSIX;
 use DBI;
 
-#$SIG{CHLD}='IGNORE';
-$| = 1;
+$SIG{CHLD}='IGNORE';
 
 $ENV{PATH}  = '/bin:/usr/bin';
 $ENV{SHELL} = '/bin/sh' if exists $ENV{SHELL};
@@ -457,6 +460,40 @@ sub Usage
         print( "This daemon is not meant to be invoked from command line\n");
     exit( -1 );
 }
+
+# https://docstore.mik.ua/orelly/perl4/cook/ch07_24.htm
+sub sysreadline(*;$) {
+    my($handle, $timeout) = @_;
+    $handle = qualify_to_ref($handle, caller( ));
+    my $infinitely_patient = (@_ == 1 || $timeout < 0);
+    my $start_time = time( );
+    my $selector = IO::Select->new( );
+    $selector->add($handle);
+    my $line = "";
+SLEEP:
+    until (at_eol($line)) {
+        unless ($infinitely_patient) {
+            return $line if time( ) > ($start_time + $timeout);
+        }
+        # sleep only 1 second before checking again
+        next SLEEP unless $selector->can_read(1.0);
+INPUT_READY:
+        while ($selector->can_read(0.0)) {
+            my $was_blocking = $handle->blocking(0);
+CHAR:       while (sysread($handle, my $nextbyte, 1)) {
+                $line .= $nextbyte;
+                last CHAR if $nextbyte eq "\n";
+            }
+            $handle->blocking($was_blocking);
+            # if incomplete line, keep trying
+            next SLEEP unless at_eol($line);
+            last INPUT_READY;
+        }
+    }
+    return $line;
+}
+sub at_eol($) { $_[0] =~ /\n\z/ }
+
 
 logInit();
 logSetSignal();
@@ -475,12 +512,18 @@ my $alarm_monitor_name="";
 my $alarm_header="";
 my $alarm_mid="";
 my $alarm_eid="";
-my $needsReload = 0;
+my @needsReload = 0;
 
 # Main entry point
 
 printInfo ("You are running version: $app_version");
 printWarning ("WARNING: SSL is disabled, which means all traffic will be unencrypted!") unless $ssl_enabled;
+
+pipe(READER,WRITER) || die "pipe failed: $!";
+WRITER->autoflush(1);
+my ($rin,$rout) = ('');
+vec($rin,fileno(READER),1) = 1;
+printDebug ("Parent<--Child pipe ready");
 
 if ($use_fcm)
 {
@@ -549,7 +592,7 @@ sub checkEvents()
 {
     
     my $eventFound = 0;
-    if ( $needsReload || ((time() - $monitor_reload_time) > $monitor_reload_interval ))
+    if (  (time() - $monitor_reload_time) > $monitor_reload_interval )
     {
         my $len = scalar @active_connections;
         printInfo ("Total event client connections: ".$len."\n");
@@ -562,7 +605,7 @@ sub checkEvents()
           {
               $cip = $_->{conn}->ip();
           }
-          printDebug ("-->Connection $ndx: IP->".$cip." Token->:...".substr($_->{token},-10)." Plat:".$_->{platform}." Push:".$_->{pushstate}); 
+          printDebug ("-->checkEvents: Connection $ndx: ID->".$_->{id}." IP->".$cip." Token->:...".substr($_->{token},-10)." Plat:".$_->{platform}." Push:".$_->{pushstate}); 
           $ndx++;
         }
         printInfo ("Reloading Monitors...\n");
@@ -571,7 +614,12 @@ sub checkEvents()
             zmMemInvalidate( $monitor );
         }
         loadMonitors();
-        $needsReload = 0;
+        @needsReload = ();
+    } elsif (@needsReload) {
+        foreach my $monitor (@needsReload) {
+            loadMonitor($monitor);
+        }
+        @needsReload = ();
     }
     @events = ();
     $alarm_header = "";
@@ -584,8 +632,8 @@ sub checkEvents()
          if (  !zmMemVerify($monitor) ) {
           # Our attempt to verify the memory handle failed. We should reload the monitors.
           # Don't need to zmMemInvalidate because the monitor reload will do it.
-          $needsReload = 1;
-          Error ("** Memory verify failed for ".$monitor->{Name}."(id:".$monitor->{Id}. ") so forcing reload");
+          push @needsReload, $monitor;
+          Warning (" Memory verify failed for ".$monitor->{Name}."(id:".$monitor->{Id}.")" );
           next;
           }
          my ( $state, $last_event, $trigger_cause, $trigger_text)
@@ -601,14 +649,15 @@ sub checkEvents()
         {
             
             if ( !defined($monitor->{LastEvent})
-                         || ($last_event != $last_event_for_monitors{$monitor->{Id}}))
+                         || ($last_event != $last_event_for_monitors{$monitor->{Id}}{"eid"}))
             {
                 $alarm_cause=zmMemRead($monitor,"shared_data:alarm_cause") if ($read_alarm_cause);
                 $alarm_cause = $trigger_cause if (defined($trigger_cause) && $alarm_cause eq "" && $trigger_cause ne "");
                 printInfo( "New event $last_event reported for ".$monitor->{Name}." ".$alarm_cause."\n");
                 $monitor->{LastState} = $state;
                 $monitor->{LastEvent} = $last_event;
-                $last_event_for_monitors{$monitor->{Id}}= $last_event;
+                $last_event_for_monitors{$monitor->{Id}}{"eid"}= $last_event;
+                $last_event_for_monitors{$monitor->{Id}}{"state"}= "recording";
                 my $name = $monitor->{Name};
                 my $mid = $monitor->{Id};
                 my $eid = $last_event;
@@ -626,6 +675,16 @@ sub checkEvents()
                 $eventFound = 1;
             }
             
+        }
+        elsif ($state == STATE_IDLE &&  $last_event_for_monitors{$monitor->{Id}}{"state"} eq "recording") 
+        {
+                my $hooktext = $last_event_for_monitors{$monitor->{Id}}{"hook_text"};
+                printDebug ("Alarm ".$monitor->{LastEvent}." for monitor:".$monitor->{Id}." has ended ".$hooktext);
+                updateEvent($monitor->{LastEvent},$hooktext) if $hooktext;
+                 
+                $last_event_for_monitors{$monitor->{Id}}{"state"}="idle";
+                $last_event_for_monitors{$monitor->{Id}}{"hook_text"}=undef;
+                
         }
     }
     chop($alarm_header) if ($alarm_header);
@@ -646,6 +705,15 @@ sub checkEvents()
     return ($eventFound);
 }
 
+sub loadMonitor {
+  my $monitor = shift;
+  printInfo( "re-loading monitor ".$monitor->{Name} );
+  zmMemInvalidate( $monitor );
+  if ( zmMemVerify( $monitor ) ) { # This will re-init shared memory
+    $monitor->{LastState} = zmGetMonitorState( $monitor );
+    $monitor->{LastEvent} = zmGetLastEvent( $monitor );
+  }
+}
 # Refreshes list of monitors from DB
 # 
 sub loadMonitors
@@ -671,6 +739,20 @@ sub loadMonitors
         $new_monitors{$monitor->{Id}} = $monitor;
       } # end while fetchrow
       %monitors = %new_monitors;
+}
+
+# Updated Notes DB of events with detection text
+# if available (hook enabled)
+sub updateEvent
+{
+    my ($eid,$notes) = @_;
+    $notes =$notes." ";
+    printDebug ("updating Notes clause for Event:".$eid. " with:".$notes);
+    my $sql = "UPDATE Events set Notes=CONCAT(?,Notes) where Id=?";
+    my $sth = $dbh->prepare_cached( $sql )
+        or Fatal( "Can't prepare '$sql': ".$dbh->errstr() );
+      my $res = $sth->execute( $notes, $eid  )
+        or Fatal( "Can't execute: ".$sth->errstr() );
 }
 
 
@@ -722,9 +804,11 @@ sub deleteToken
         next if ($_ eq "" || $token eq $dtoken);
         print $fh "$_\n";
         #print "delete: $row\n";
+        my $tod = gettimeofday;
         push @active_connections, {
+                       id=> $tod,
                        token => $token,
-                       state => VALID_WEBSOCKET,
+                       state => INVALID_WEBSOCKET,
                        time=>time(),
                        badge => 0,
                        monlist => $monlist,
@@ -753,7 +837,7 @@ sub sendOverMQTTBroker
                 state => 'alarm',
             });
 
-    Debug ("Final JSON being sent is: $json");
+   
 
     if (defined $mqtt_username && defined $mqtt_password)
     {
@@ -764,6 +848,7 @@ sub sendOverMQTTBroker
         $mqtt = Net::MQTT::Simple->new($mqtt_server);
     }
 
+    printDebug("Sending message over MQTT:".$json);
     $mqtt->publish(join('/','zoneminder',$mid) => $json);
 }
 
@@ -804,6 +889,7 @@ sub sendOverFCM
 
     my $android_message = {
             to=>$obj->{token},
+            priority=>'high',
             data=> {
                 title=>$title,
                 message=>$header." at ".$now,
@@ -813,6 +899,7 @@ sub sendOverFCM
                 mid=>$mid,
                 eid=>$eid,
                 badge=>$obj->{badge},
+                priority=>1
             }
         };
 
@@ -820,7 +907,7 @@ sub sendOverFCM
         $android_message->{'data'}->{'style'} = 'picture';
         $android_message->{'data'}->{'picture'} = $pic;
         $android_message->{'data'}->{'summaryText'} = 'alarmed image';
-        printDebug ("Alarm image for android will be: $pic");
+        #printDebug ("Alarm image for android will be: $pic");
     } 
 
 
@@ -836,7 +923,7 @@ sub sendOverFCM
         
     }
 
-    printDebug ("Final JSON being sent is: $json");
+    #printDebug ("Final JSON being sent is: $json");
     my $req = HTTP::Request->new ('POST', $uri);
     $req->header( 'Content-Type' => 'application/json', 'Authorization'=> $key);
      $req->content($json);
@@ -873,6 +960,70 @@ sub sendOverFCM
 
 }
 
+# credit: https://stackoverflow.com/a/52724546/1361529
+sub processJobs
+{
+    while ((my $read_avail = select($rout=$rin, undef, undef, 0.0)) !=0)
+   {
+
+   
+        if ($read_avail < 0) {
+            if (!$!{EINTR}) {
+                printError("Pipe read error: $read_avail $!");
+            }
+        } elsif ($read_avail > 0) {
+            chomp(my $txt = sysreadline(READER));
+            printDebug ("PARENT GOT RAW TEXT-->$txt");
+            my ($job,$msg) = split("--TYPE--",$txt);
+            
+            if ( $job eq "message") {
+                my ($id, $tmsg) = split("--SPLIT--",$msg);
+                printDebug ("GOT JOB==>To: $id, message: $tmsg");
+                foreach (@active_connections) {
+                    if (($_->{id} eq $id) && exists $_->{conn} ) {
+                            my $tip = $_->{conn}->ip();
+                            my $tport = $_->{conn}->port();
+                            printInfo ("Sending child message to $tip:$tport...");
+                            eval {$_->{conn}->send_utf8($tmsg);};
+                            if ($@)
+                            { 
+
+                                printInfo ("Marking ".$_->{conn}->ip()." as bad socket");     
+                                $_->{state} = INVALID_WEBSOCKET;
+
+                            }
+                        }
+                    }
+
+            }
+            elsif ($job eq "event_description") {
+                my ($mid, $desc) = split("--SPLIT--",$msg);
+                printDebug("GOT JOB==> Update monitor ".$mid." description:".$desc);
+                $last_event_for_monitors{$mid}{"hook_text"}= $desc;
+                
+            } 
+            elsif ($job eq "timestamp") {
+                my ($id, $mid, $timeval) = split ("--SPLIT--",$msg);
+                printDebug ("GOT JOB==> Update last sent timestamp of monitor:".$mid." to ".$timeval. " for id:".$id);
+                foreach (@active_connections) {
+                    if ( $_->{id} eq $id ) {
+                        $_->{last_sent}->{$mid} = $timeval; 
+
+                    }
+                    
+                }
+                #dump(@active_connections);
+            }
+            else {
+            printDebug ("Job message not recognized!");
+        }
+        }
+    }
+      
+    printDebug ("Empty job queue");
+       
+}
+
 
 # This runs at each tick to purge connections
 # that are inactive or have had an error
@@ -907,7 +1058,7 @@ sub checkConnection
     my $ac = scalar @active_connections;
     my $ac1 = scalar grep  {$_->{state} ==  VALID_WEBSOCKET} @active_connections;
     my $ac2 = scalar grep  {$_->{state} ==  INVALID_WEBSOCKET} @active_connections;
-    my $ac3 = scalar grep  {$_->{state} ==  PENDING_AUTH} @active_connections;
+    my $ac3 = scalar grep  {$_->{state} == PENDING_AUTH} @active_connections;
     printDebug ("After tick: TOTAL: $ac, VALID_WEBSOCKET: $ac1, INVALID_WEBSOCKET: $ac2, PENDING_AUTH: $ac3");
     
 
@@ -1131,6 +1282,10 @@ sub checkMessage
     {
         my $uname = $json_string->{'data'}->{'user'};
         my $pwd = $json_string->{'data'}->{'password'};
+        my $monlist = "";
+        my $intlist = "";
+        $monlist = $json_string->{'data'}->{'monlist'} if (exists($json_string->{'data'}->{'monlist'}) );
+        $intlist = $json_string->{'data'}->{'intlist'} if (exists($json_string->{'data'}->{'intlist'}) );
     
         foreach (@active_connections)
         {
@@ -1153,6 +1308,8 @@ sub checkMessage
 
                     # all good, connection auth was valid
                     $_->{state}=VALID_WEBSOCKET;
+                    $_->{monlist} = $monlist;
+                    $_->{intlist} = $intlist;
                     $_->{token}='';
                     my $str = encode_json({event=>'auth', type=>'', status=>'Success', reason => '', version => $app_version});
                     eval {$_->{conn}->send_utf8($str);};
@@ -1201,7 +1358,9 @@ sub loadTokens
         next if ($_ eq "");
         print $fh "$_\n";
         my ($token, $monlist, $intlist, $platform, $pushstate)  = rsplit(qr/:/, $_, 5); # split (":",$_);
+        my $tod = gettimeofday;
         push @active_connections, {
+               id => $tod,
                token => $token,
                state => INVALID_WEBSOCKET,
                time=>time(),
@@ -1392,6 +1551,8 @@ sub processAlarms {
         return if ($resCode !=0);
 
         $alarm_header = $resTxt if ($use_hook_description);
+        print WRITER "event_description--TYPE--".$alarm_mid."--SPLIT--".$resTxt."\n";
+     
         
     }
 
@@ -1411,9 +1572,11 @@ sub processAlarms {
         my $monlist = $_->{monlist};
         my $intlist = $_->{intlist};
         my $last_sent = $_->{last_sent};
+        
         my $obj = $_;
-        my $connid = getIdentity($obj);
-        printInfo ("Checking alarm rules for $connid");
+        my $id = getIdentity($obj);
+        my $connId = $_->{id};
+        printInfo ("Checking alarm rules for $id");
         # we need to create a per connection array which will be
         # a subset of main events with the ones that are not in its
         # monlist left out
@@ -1424,6 +1587,7 @@ sub processAlarms {
             {
                 my $mint = getInterval($intlist, $monlist, $_->{MonitorId});
                 my $elapsed;
+                my $t = time();
                 if ($last_sent->{$_->{MonitorId}})
                 {
                     $elapsed = time() -  $last_sent->{$_->{MonitorId}};
@@ -1432,7 +1596,9 @@ sub processAlarms {
                         printInfo("Monitor ".$_->{MonitorId}." event: sending this out as $elapsed is >= interval of $mint");
                         $_->{Cause} = $alarm_header if ($hook && $use_hook_description);
                         push (@localevents, $_);
-                        $last_sent->{$_->{MonitorId}} = time();
+                        #$last_sent->{$_->{MonitorId}} = time();
+                        print WRITER "timestamp--TYPE--".$connId."--SPLIT--".$_->{MonitorId}."--SPLIT--".$t."\n";
+                      
                     }
                     else
                     {
@@ -1444,10 +1610,12 @@ sub processAlarms {
                 else
                 {
                     # This means we have no record of sending any event to this monitor
-                    $last_sent->{$_->{MonitorId}} = time();
+                    #$last_sent->{$_->{MonitorId}} = time();
                     printInfo("Monitor ".$_->{MonitorId}." event: last time not found, so sending");
                     $_->{Cause} = $alarm_header if ($hook && $use_hook_description);
                     push (@localevents, $_);
+                    print WRITER "timestamp--TYPE--".$connId."--SPLIT--".$_->{MonitorId}."--SPLIT--".$t."\n";
+                   
                 }
 
             }
@@ -1484,15 +1652,10 @@ sub processAlarms {
             {
                 if (exists $_->{conn})
                 {
-                    printInfo ($_->{conn}->ip()."-sending supplementary data over websockets\n");
-                    eval {$_->{conn}->send_utf8($sup_str);};
-                    if ($@)
-                    {
-            
-                        printInfo ("Marking ".$_->{conn}->ip()." as bad socket, as websocket send error with token:",$_->{token});     
-                        $_->{state} = INVALID_WEBSOCKET;
-
-                    }
+                    #printInfo ($_->{conn}->ip()."-sending supplementary data over websockets\n");
+                    print WRITER "message--TYPE--".$_->{id}."--SPLIT--".$sup_str."\n";
+                   
+                   
                 }
             }
 
@@ -1503,13 +1666,10 @@ sub processAlarms {
         {
             if (exists $_->{conn})
             {
-                printInfo ($_->{conn}->ip()."-sending over websockets\n");
-                eval {$_->{conn}->send_utf8($str);};
-                if ($@)
-                {
-                    printInfo ("Marking ".$_->{conn}->ip()." for deletion, as websocket send error");     
-                    $_->{state} = PENDING_DELETE;
-                }
+                #printInfo ($_->{conn}->ip()."-sending over websockets\n");
+                printDebug ("Child: posting job to send out message to id:".$_->{id}."->".$_->{conn}->ip().":".$_->{conn}->port());
+                print WRITER "message--TYPE--".$_->{id}."--SPLIT--".$str."\n";
+             
             }
          }
     } # foreach
@@ -1553,35 +1713,33 @@ sub initSocketServer
         on_tick => sub {
             printDebug("---------->Tick START<--------------");
             checkConnection();
+            processJobs();
             if (checkEvents())
             {
             
-                processAlarms();
-                #threads->create ( sub {
-                #   processAlarms();
-                #    printInfo ("Terminating thread to handle alarm for:".$alarm_eid." monitor:".$alarm_mid);
-                #   threads->detach();
-                #});
-                # disable forking for now
-                # as child exit kills the socket
+              
+                my $pid = fork;
+                if (!defined $pid) {
+                    die "Cannot fork: $!";
 
-                #processAlarms();
-                #my $pid = fork;
-                #if (!defined $pid) {
-                #    die "Cannot fork: $!";
-
-                #}
-                #elsif ($pid == 0) {
-                #    # client
-                #    local $SIG{'CHLD'} = 'DEFAULT';
-                #    printInfo ("Forking process to handle alarm for:".$alarm_eid." monitor:".$alarm_mid);
-                #    processAlarms();
-                #    printInfo ("Ending process to handle alarm for:".$alarm_eid." monitor:".$alarm_mid);
-                #    exit 0; 
-                #}
+                }
+                elsif ($pid == 0) {
+                    # client
+                    local $SIG{'CHLD'} = 'DEFAULT';
+                    printInfo ("Forking process:$$ to handle alarm for:".$alarm_eid." monitor:".$alarm_monitor_name);
+                    processAlarms();
+                    printInfo ("Ending process to handle alarm for:".$alarm_eid." monitor:".$alarm_monitor_name);
+                    exit 0; 
+                }
                 
 
             }
+
+  
+            #foreach (@active_connections) {
+            #    print $_->{id}.": monlist=".$_->{monlist}." :intlist=".$_->{intlist}."\n";
+            #}
+
             printDebug("---------->Tick END<--------------");
         },
         # called when a new connection comes in
@@ -1601,9 +1759,11 @@ sub initSocketServer
                 handshake => sub {
                     my ($conn, $handshake) = @_;
                     printDebug("---------->onConnect:handshake START<--------------");
-                    printInfo ("Websockets: New Connection Handshake requested from ".$conn->ip().":".$conn->port()." state=pending auth");
+                    my $id = gettimeofday;
+                    printInfo ("Websockets: New Connection Handshake requested from ".$conn->ip().":".$conn->port()." state=pending auth, id=".$id);
                     my $connect_time = time();
                     push @active_connections, {conn => $conn, 
+                                   id => $id,
                                    state => PENDING_AUTH, 
                                    time=>$connect_time, 
                                    monlist => "",
