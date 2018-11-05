@@ -86,7 +86,7 @@ RUN	apt-get -y install python-pip && \
  	apt-get -y install libxrender-dev && \
  	pip install opencv-python
 
-RUN	apt-get -y remove wget make && \
+RUN	apt-get -y remove make && \
 	apt-get -y clean && \
 	apt-get -y autoremove && \
 	rm -rf /tmp/* /var/tmp/*
